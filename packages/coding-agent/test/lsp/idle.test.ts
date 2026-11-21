@@ -1,6 +1,18 @@
 import { describe, expect, it } from "bun:test";
-import { isIdleClient, sendRequest } from "@oh-my-pi/pi-coding-agent/lsp/client";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+	borrowPrivateBasedpyright,
+	checkIdleClients,
+	ensureWorkspaceFolders,
+	getOrCreateClient,
+	isIdleClient,
+	sendRequest,
+	shutdownClientInstance,
+} from "@oh-my-pi/pi-coding-agent/lsp/client";
 import type { LspClient } from "@oh-my-pi/pi-coding-agent/lsp/types";
+import { isFileLockHeld } from "@oh-my-pi/pi-utils";
 
 const IDLE_TIMEOUT_MS = 60_000;
 
@@ -143,3 +155,160 @@ describe("idle checker (#8390)", () => {
 		expect(isIdleClient(client, Date.now(), IDLE_TIMEOUT_MS)).toBe(false);
 	});
 });
+
+const nativeFixture = `
+import { appendFileSync, existsSync } from "node:fs";
+const [transcript, release] = process.argv.slice(2);
+let buffer = Buffer.alloc(0);
+const send = message => {
+	const body = JSON.stringify({ jsonrpc: "2.0", ...message });
+	process.stdout.write("Content-Length: " + Buffer.byteLength(body) + "\\r\\n\\r\\n" + body);
+};
+for await (const chunk of process.stdin) {
+	buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
+	while (true) {
+		const header = buffer.indexOf("\\r\\n\\r\\n");
+		if (header < 0) break;
+		const length = Number(buffer.subarray(0, header).toString().split(":")[1]);
+		if (buffer.length < header + 4 + length) break;
+		const message = JSON.parse(buffer.subarray(header + 4, header + 4 + length).toString());
+		buffer = buffer.subarray(header + 4 + length);
+		appendFileSync(transcript, JSON.stringify({ pid: process.pid, ...message }) + "\\n");
+		if (message.method === "initialize") {
+			send({ id: message.id, result: { capabilities: { referencesProvider: true } } });
+		} else if (message.method === "fixture/finishAnalysis") {
+			send({ method: "$/progress", params: { token: "analysis", value: { kind: "begin", title: "" } } });
+			send({ method: "$/progress", params: { token: "analysis", value: { kind: "end" } } });
+			send({ id: message.id, result: null });
+		} else if (message.method === "shutdown") {
+			send({ id: message.id, result: null });
+		} else if (message.method === "exit") {
+			if (existsSync(release + ".block")) {
+				const child = Bun.spawn([process.execPath, "-e", \`
+					const release = process.argv[1];
+					const deadline = Date.now() + 4000;
+					while (!(await Bun.file(release).exists()) && Date.now() < deadline) await Bun.sleep(10);
+					await Bun.write(release + ".done", "exited by protocol fixture");
+				\`, release], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+				child.unref();
+			}
+			process.exit(0);
+		}
+	}
+}
+`;
+
+async function withNativeFixture(
+	run: (
+		workspace: string,
+		config: LspClient["config"],
+		lock: string,
+		transcript: string,
+		release: string,
+	) => Promise<void>,
+): Promise<void> {
+	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-private-lsp-")));
+	const workspace = path.join(root, ".worktrees", "a");
+	await fs.mkdir(workspace, { recursive: true });
+	const file = path.join(root, "langserver.ts");
+	const transcript = path.join(root, "transcript.jsonl");
+	const release = path.join(root, "release");
+	const lock = path.join(root, "cold-start");
+	await Bun.write(file, nativeFixture);
+	const priorRoot = process.env.OMP_PRIVATE_BASEDPYRIGHT_ROOT;
+	const priorLock = process.env.OMP_PRIVATE_BASEDPYRIGHT_LOCK;
+	process.env.OMP_PRIVATE_BASEDPYRIGHT_ROOT = workspace;
+	process.env.OMP_PRIVATE_BASEDPYRIGHT_LOCK = lock;
+	try {
+		await run(
+			workspace,
+			{
+				command: "basedpyright-langserver",
+				resolvedCommand: process.execPath,
+				args: [file, transcript, release],
+				fileTypes: [".py"],
+				rootMarkers: [],
+			},
+			lock,
+			transcript,
+			release,
+		);
+	} finally {
+		await Bun.write(release, "");
+		if (priorRoot === undefined) delete process.env.OMP_PRIVATE_BASEDPYRIGHT_ROOT;
+		else process.env.OMP_PRIVATE_BASEDPYRIGHT_ROOT = priorRoot;
+		if (priorLock === undefined) delete process.env.OMP_PRIVATE_BASEDPYRIGHT_LOCK;
+		else process.env.OMP_PRIVATE_BASEDPYRIGHT_LOCK = priorLock;
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}
+
+const macTest = it.skipIf(process.platform !== "darwin");
+
+macTest("holds the cold lease across operations and reopens on demand", async () => {
+	await withNativeFixture(async (workspace, config, lock, transcript) => {
+		const client = await getOrCreateClient(config, workspace);
+		try {
+			expect(isFileLockHeld(lock)).toBe(true);
+			{
+				using _borrow = borrowPrivateBasedpyright(workspace);
+				await sendRequest(client, "fixture/finishAnalysis", {});
+				await client.projectLoaded;
+				expect(isFileLockHeld(lock)).toBe(true);
+				client.lastActivity = Date.now() - 180_000;
+				await checkIdleClients();
+				expect(client.proc.exitCode).toBeNull();
+			}
+			expect(isFileLockHeld(lock)).toBe(false);
+			await expect(ensureWorkspaceFolders(client, [transcript])).rejects.toThrow("outside its workspace");
+			client.lastActivity = Date.now() - 180_000;
+			await checkIdleClients();
+			expect(client.proc.exitCode).toBe(0);
+			const replacement = await getOrCreateClient(config, workspace);
+			try {
+				expect(replacement.proc.pid).not.toBe(client.proc.pid);
+				const events = (await Bun.file(transcript).text())
+					.trim()
+					.split("\n")
+					.map(line => JSON.parse(line));
+				expect(events.map(row => row.method)).toContain("exit");
+				for (const row of events.filter(row => row.method === "initialize")) {
+					expect(row.params.rootPath).toBe(workspace);
+					expect(row.params.workspaceFolders).toHaveLength(1);
+				}
+			} finally {
+				await shutdownClientInstance(replacement);
+			}
+		} finally {
+			await shutdownClientInstance(client);
+		}
+	});
+});
+
+macTest(
+	"does not replace a server with a surviving worker",
+	async () => {
+		await withNativeFixture(async (workspace, config, lock, _transcript, release) => {
+			await Bun.write(release + ".block", "");
+			const client = await getOrCreateClient(config, workspace);
+			try {
+				expect(await shutdownClientInstance(client)).toBe(false);
+				expect(client.proc.exitCode).toBe(0);
+				expect(isFileLockHeld(lock)).toBe(true);
+				await expect(getOrCreateClient(config, workspace)).rejects.toThrow("has not released");
+			} finally {
+				await Bun.write(release, "");
+				// The orphan is an OS process, so fake timers cannot observe its actual exit.
+				const deadline = Date.now() + 3000;
+				while (isFileLockHeld(lock) && Date.now() < deadline) {
+					await Bun.sleep(20);
+					// Re-observe the same group, never signal or start a second one.
+					await shutdownClientInstance(client);
+				}
+			}
+			expect(await Bun.file(release + ".done").text()).toBe("exited by protocol fixture");
+			expect(isFileLockHeld(lock)).toBe(false);
+		});
+	},
+	7000,
+);

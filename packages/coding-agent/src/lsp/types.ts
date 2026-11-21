@@ -1,4 +1,5 @@
 import { type } from "@oh-my-pi/omptype";
+import type { FileLockHandle } from "@oh-my-pi/pi-utils";
 import { TOOL_TIMEOUTS } from "../tools/tool-timeouts";
 import type { WatchedFilesForwarder } from "./watched-files";
 
@@ -456,6 +457,15 @@ export interface LspClient {
 	cwd: string;
 	config: ServerConfig;
 	proc: LspTransport;
+	/** Present only for a launcher-owned, private macOS Basedpyright generation. */
+	nativeBasedpyright?: {
+		permit?: FileLockHandle;
+		writes: number;
+		analysis: Set<string | number>;
+		analysisCompleted: boolean;
+		ready: boolean;
+		stopping?: Promise<boolean>;
+	};
 	requestId: number;
 	diagnostics: Map<string, PublishedDiagnostics>;
 	/** Diagnostics delivered via `textDocument/publishDiagnostics` notifications. */

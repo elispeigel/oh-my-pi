@@ -5,6 +5,7 @@ import { isRecord, logger, untilAborted, toError } from "@oh-my-pi/pi-utils";
 import { formatPathRelativeToCwd } from "../tools/path-utils";
 import { throwIfAborted } from "../tools/tool-errors";
 import {
+	borrowPrivateBasedpyright,
 	getOrCreateClient,
 	LspRequestTimeoutError,
 	LspResponseError,
@@ -569,6 +570,7 @@ export async function captureDiagnosticVersions(
 	initTimeoutMs?: number,
 	signal?: AbortSignal,
 ): Promise<ServerVersionMap> {
+	using _nativeOperation = borrowPrivateBasedpyright(cwd);
 	const versions = new Map<string, number>();
 	await Promise.allSettled(
 		servers.map(async ([serverName, serverConfig]) => {
@@ -586,6 +588,7 @@ export async function captureOpenFileVersions(
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
 ): Promise<ServerVersionMap> {
+	using _nativeOperation = borrowPrivateBasedpyright(cwd);
 	const uri = fileToUri(absolutePath);
 	const versions = new Map<string, number>();
 	await Promise.allSettled(
@@ -640,6 +643,7 @@ export async function getDiagnosticsForFile(
 			const budgetSignal = AbortSignal.timeout(pipelineBudgetMs);
 			const boundSignal = signal ? AbortSignal.any([signal, budgetSignal]) : budgetSignal;
 			return untilAborted(boundSignal, async () => {
+				using _nativeOperation = borrowPrivateBasedpyright(cwd);
 				throwIfAborted(boundSignal);
 				// Use custom linter client if configured
 				if (serverConfig.createClient) {
@@ -754,6 +758,7 @@ export async function formatContent(
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
 ): Promise<FormatContentResult> {
+	using _nativeOperation = borrowPrivateBasedpyright(cwd);
 	if (servers.length === 0) {
 		// No formatters configured at all
 		return { content, failed: false, unsupported: true };

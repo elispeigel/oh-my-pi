@@ -4,6 +4,7 @@ import type { BunFile } from "bun";
 import { isPermissionDeniedError, writeFileWithFallback } from "../tools/file-write-fallback";
 import {
 	beginPendingDiskWrite,
+	borrowPrivateBasedpyright,
 	endPendingDiskWrite,
 	getActiveOrPendingClient,
 	getOrCreateClient,
@@ -413,6 +414,7 @@ async function runLspWritethrough(
 	},
 	runOptions?: RunLspWritethroughOptions,
 ): Promise<WritethroughResult> {
+	using _nativeOperation = borrowPrivateBasedpyright(cwd);
 	const { enableFormat, enableDiagnostics } = options;
 	const contentAlreadyWritten = runOptions?.contentAlreadyWritten ?? false;
 
@@ -499,6 +501,7 @@ async function runLspWritethrough(
 		);
 		operationSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 		await untilAborted(operationSignal, async () => {
+			using _activePipeline = borrowPrivateBasedpyright(cwd);
 			if (enableDiagnostics) {
 				// The target overlay leads disk until commit; reconcile only other
 				// open documents before computing diagnostics for the new content.

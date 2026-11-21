@@ -198,6 +198,28 @@ Shut down language servers that have been inactive for more than five minutes:
 }
 ```
 
+### Launcher-scoped private Basedpyright on macOS
+
+A native launcher may opt in one run with `OMP_PRIVATE_BASEDPYRIGHT_ROOT` (the
+canonical, absolute private workspace) and `OMP_PRIVATE_BASEDPYRIGHT_LOCK` (an
+absolute file-lock base in an owner-controlled runtime directory). Use the
+same lock base for lanes on the same host. Do not set these globally.
+
+For the built-in `basedpyright-langserver` command, this uses private stdio
+instead of either mux and serializes cold starts until the server reports
+analysis completed or a cross-file reference search returns a positive result
+inside the private workspace, and the operation drains. Without either signal
+the permit remains held until the private process group is verified gone.
+Tools still use their existing deadlines and full workspace; they do not
+return empty results to indicate a lease refusal.
+
+After two minutes of inactivity, the idle sweep may send `shutdown` and `exit`
+once no operation, protocol write, pending RPC or index progress remains. The
+next use opens a new private generation on the same workspace. If graceful
+exit cannot be verified, the client refuses a duplicate instead of signalling
+the process. This setting does not qualify an untrusted server, a server
+that detaches its workers, or a second workspace root.
+
 ### Disable a server for one project, keep it globally
 
 Place the override in `<project>/.omp/lsp.json`:

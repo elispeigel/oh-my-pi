@@ -20,12 +20,14 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { clampTimeout, resolveLspTimeouts, TOOL_TIMEOUTS } from "../tools/tool-timeouts";
 import {
 	applyWorkspaceEditWithLsp,
+	borrowPrivateBasedpyright,
 	clearInitializationFailure,
 	ensureWorkspaceFolders,
 	getActiveClients,
 	getOrCreateClient,
 	isRustAnalyzerClient,
 	type LspServerStatus,
+	notePrivateBasedpyrightReferences,
 	reconcileFileFromDisk,
 	reconcileIdleChecker,
 	reconcileOpenFilesFromDisk,
@@ -353,6 +355,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		_onUpdate?: AgentToolUpdateCallback<LspToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<LspToolDetails>> {
+		using _nativeOperation = borrowPrivateBasedpyright(this.session.cwd);
 		const { action, file, line, symbol, query, new_name, apply, timeout } = params;
 		if (this.session.lspReadOnly && !LSP_READONLY_ACTIONS.has(action)) {
 			throw new ToolError(`LSP action ${action} is disabled in this read-only session`);
@@ -1611,6 +1614,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						if (missing) output += `\n${missing}`;
 						else useless = true;
 					} else {
+						notePrivateBasedpyrightReferences(client, uri, result);
 						const contextualReferences = result.slice(0, REFERENCE_CONTEXT_LIMIT);
 						const plainReferences = result.slice(REFERENCE_CONTEXT_LIMIT);
 						const contextualLines = await Promise.all(

@@ -2,7 +2,16 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { glob } from "@oh-my-pi/pi-natives";
-import { isEnoent, logger, postmortem, ptree, stableStringifyJson, untilAborted } from "@oh-my-pi/pi-utils";
+import {
+	acquireFileLock,
+	type FileLockHandle,
+	isEnoent,
+	logger,
+	postmortem,
+	ptree,
+	stableStringifyJson,
+	untilAborted,
+} from "@oh-my-pi/pi-utils";
 import { encodeMessageFrame, MessageFramer } from "../jsonrpc/message-framing";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { resolveSyscallTarget } from "../tools/path-utils";
@@ -28,6 +37,7 @@ import {
 import {
 	type DocumentBuildStatus,
 	FileChangeType,
+	type Location,
 	type LspClient,
 	type LspJsonRpcId,
 	type LspJsonRpcNotification,
@@ -109,6 +119,110 @@ const READER_EXIT_GRACE_MS = 100;
 let idleTimeoutMs: number | null = null;
 let idleCheckInterval: NodeJS.Timeout | null = null;
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000;
+
+const NATIVE_BASEDPYRIGHT_IDLE_MS = 120_000;
+const NATIVE_BASEDPYRIGHT_LOCK_WAIT_MS = 30_000;
+const nativeOperations = new Map<string, number>();
+// Keep the generation reserved even after the wrapper exits, until its private process group drains.
+const nativeClients = new Map<string, LspClient>();
+
+function nativeBasedpyrightLock(config: ServerConfig, cwd: string): string | undefined {
+	if (config.command !== "basedpyright-langserver") return undefined;
+	const root = process.env.OMP_PRIVATE_BASEDPYRIGHT_ROOT;
+	const lock = process.env.OMP_PRIVATE_BASEDPYRIGHT_LOCK;
+	if (root === undefined && lock === undefined) return undefined;
+	if (
+		process.platform !== "darwin" ||
+		!root ||
+		!path.isAbsolute(root) ||
+		root !== cwd ||
+		!lock ||
+		!path.isAbsolute(lock) ||
+		path.normalize(lock) !== lock
+	) {
+		throw new Error("Private Basedpyright requires an exact local workspace and absolute index lease");
+	}
+	return lock;
+}
+
+/** Keep the workspace generation borrowed across gaps between RPCs, including deferred diagnostics. */
+export function borrowPrivateBasedpyright(cwd: string): Disposable | undefined {
+	if (process.env.OMP_PRIVATE_BASEDPYRIGHT_ROOT !== cwd) return undefined;
+	nativeOperations.set(cwd, (nativeOperations.get(cwd) ?? 0) + 1);
+	return {
+		[Symbol.dispose]() {
+			const remaining = (nativeOperations.get(cwd) ?? 1) - 1;
+			if (remaining > 0) {
+				nativeOperations.set(cwd, remaining);
+				return;
+			}
+			nativeOperations.delete(cwd);
+			const client = nativeClients.get(cwd);
+			if (client) {
+				client.lastActivity = Date.now();
+				releaseReadyNativePermit(client);
+			}
+		},
+	};
+}
+
+function releaseReadyNativePermit(client: LspClient): void {
+	const native = client.nativeBasedpyright;
+	if (
+		!native?.permit ||
+		!native.ready ||
+		native.stopping ||
+		nativeOperations.has(client.cwd) ||
+		native.writes ||
+		client.pendingRequests.size ||
+		client.activeProgressTokens.size
+	)
+		return;
+	native.permit.release();
+	native.permit = undefined;
+}
+
+/** A completed cross-file search is also readiness evidence when open-files analysis emits no progress. */
+export function notePrivateBasedpyrightReferences(
+	client: LspClient,
+	uri: string,
+	references: readonly Location[],
+): void {
+	const native = client.nativeBasedpyright;
+	if (!native?.permit) return;
+	for (const ref of references) {
+		if (ref.uri === uri || !ref.uri.startsWith("file:") || !isPathInsideWorkspace(uriToFile(ref.uri), client.cwd))
+			continue;
+		native.ready = true;
+		releaseReadyNativePermit(client);
+		return;
+	}
+}
+
+function releaseNativeGenerationIfGone(client: LspClient): boolean {
+	const native = client.nativeBasedpyright;
+	const pid = client.proc.pid;
+	if (!native || pid === undefined || client.proc.exitCode === null) return false;
+	// ptree.spawn(detached:true) creates a private group. The Python wrapper and Node
+	// inherit it; Node worker threads share the Node process. A leader exit is not enough.
+	try {
+		const result = Bun.spawnSync(["/bin/ps", "-axo", "pgid=,stat="], { stderr: "ignore" });
+		if (result.exitCode !== 0) return false;
+		const output = result.stdout.toString().trim();
+		if (!output) return false;
+		for (const row of output.split("\n")) {
+			const fields = /^\s*(\d+)\s+(\S+)\s*$/.exec(row);
+			if (!fields || (Number(fields[1]) === pid && !fields[2].startsWith("Z"))) return false;
+		}
+	} catch {
+		return false;
+	}
+	native.permit?.release();
+	native.permit = undefined;
+	if (nativeClients.get(client.cwd) === client) nativeClients.delete(client.cwd);
+	if (clients.get(client.name) === client) clients.delete(client.name);
+	return true;
+}
 
 // Shared server mode: language servers hosted by the omp daemon's `lsp` module, one
 // per attached client; a released server lingers for reuse until its idle policy stops it.
@@ -334,20 +448,27 @@ export function setIdleTimeout(ms: number | null | undefined): void {
  */
 export function isIdleClient(client: LspClient, now: number, timeoutMs: number): boolean {
 	if (client.pendingRequests.size > 0) return false;
+	const native = client.nativeBasedpyright;
+	if (
+		native &&
+		(native.stopping || native.writes || nativeOperations.has(client.cwd) || client.activeProgressTokens.size > 0)
+	)
+		return false;
 	return now - client.lastActivity > timeoutMs;
 }
 
 function hasConfiguredIdleTimeout(client?: LspClient): boolean {
 	if (idleTimeoutMs && idleTimeoutMs > 0) return true;
-	if (client) {
-		const timeoutMs = getConfig(client.cwd).idleTimeoutMs;
-		if (timeoutMs && timeoutMs > 0) return true;
-	}
-	for (const c of clients.values()) {
-		const timeoutMs = getConfig(c.cwd).idleTimeoutMs;
-		if (timeoutMs && timeoutMs > 0) return true;
-	}
+	if (client && clientIdleTimeout(client)) return true;
+	for (const candidate of clients.values()) if (clientIdleTimeout(candidate)) return true;
 	return false;
+}
+
+function clientIdleTimeout(client: LspClient): number {
+	const ms = client.nativeBasedpyright
+		? NATIVE_BASEDPYRIGHT_IDLE_MS
+		: (idleTimeoutMs ?? getConfig(client.cwd).idleTimeoutMs);
+	return ms && ms > 0 ? ms : 0;
 }
 
 function maybeStartIdleChecker(client?: LspClient): void {
@@ -390,7 +511,7 @@ function maybeStopIdleChecker(): void {
 export async function checkIdleClients(): Promise<void> {
 	const now = Date.now();
 	for (const [key, client] of Array.from(clients.entries())) {
-		const timeoutMs = idleTimeoutMs ?? getConfig(client.cwd).idleTimeoutMs;
+		const timeoutMs = clientIdleTimeout(client);
 		if (timeoutMs && timeoutMs > 0 && isIdleClient(client, now, timeoutMs)) {
 			await shutdownClient(key);
 		}
@@ -607,6 +728,11 @@ async function writeMessage(
  * callers do not grab the corpse before `proc.exited` cleans up.
  */
 function teardownWedgedClient(client: LspClient): void {
+	if (client.nativeBasedpyright) {
+		// No working transport; preserve the reservation rather than signalling or respawning.
+		client.status = "error";
+		return;
+	}
 	if (clients.get(client.name) === client) clients.delete(client.name);
 	try {
 		client.proc.kill();
@@ -631,6 +757,13 @@ function queueWriteMessage(
 	signal?: AbortSignal,
 	deliverQueued = false,
 ): Promise<void> {
+	const native = client.nativeBasedpyright;
+	if (native) {
+		if (native.stopping && (!("method" in message) || (message.method !== "shutdown" && message.method !== "exit"))) {
+			return Promise.reject(new Error("Private Basedpyright is retiring"));
+		}
+		native.writes++;
+	}
 	const write = client.writeQueue
 		.catch(() => {})
 		.then(() =>
@@ -650,7 +783,14 @@ function queueWriteMessage(
 		}
 		throw err;
 	});
-	client.writeQueue = result.catch(() => {});
+	const drained = result.catch(() => {});
+	client.writeQueue = native
+		? drained.finally(() => {
+				native.writes--;
+				client.lastActivity = Date.now();
+				releaseReadyNativePermit(client);
+			})
+		: drained;
 	// Keep the internal queue chained so writes stay serialized, but do not make
 	// this caller wait forever behind an earlier wedged write. `writeMessage`
 	// observes the same signal once this write reaches the sink; until then the
@@ -735,14 +875,23 @@ async function startMessageReader(client: LspClient): Promise<void> {
 								client.diagnosticsVersion += 1;
 								if (typeof params.version === "number") client.publishesDocumentVersions = true;
 							} else if (message.method === "$/progress" && message.params) {
-								const params = message.params as { token: string | number; value?: { kind?: string } };
+								const params = message.params as {
+									token: string | number;
+									value?: { kind?: string; title?: string };
+								};
+								const native = client.nativeBasedpyright;
 								if (params.value?.kind === "begin") {
 									client.activeProgressTokens.add(params.token);
+									// Basedpyright's background analysis uses an empty title; a normal
+									// references request has its own titled work-done progress.
+									if (native && params.value.title === "") native.analysis.add(params.token);
 									clearTimeout(projectQuietTimers.get(client));
 									countFolderLoad(client, -1);
 								} else if (params.value?.kind === "end") {
 									client.activeProgressTokens.delete(params.token);
+									if (native?.analysis.delete(params.token)) native.analysisCompleted = true;
 									if (client.activeProgressTokens.size === 0) settleProjectLoadWhenQuiet(client);
+									if (native) client.lastActivity = Date.now();
 								}
 							} else if (message.method === "textDocument/clangd.fileStatus" && message.params) {
 								const params = message.params as { uri: string; state?: string };
@@ -803,7 +952,7 @@ async function startMessageReader(client: LspClient): Promise<void> {
 		// so tear the client down — the next call respawns instead of timing out.
 		if (client.proc.exitCode === null) {
 			client.status = "error";
-			if (clients.get(client.name) === client) {
+			if (!client.nativeBasedpyright && clients.get(client.name) === client) {
 				clients.delete(client.name);
 			}
 			const teardownErr = new Error("LSP reader stopped; client torn down");
@@ -812,7 +961,7 @@ async function startMessageReader(client: LspClient): Promise<void> {
 			}
 			client.pendingRequests.clear();
 			client.resolveProjectLoaded();
-			client.proc.kill();
+			if (!client.nativeBasedpyright) client.proc.kill();
 		}
 	}
 }
@@ -864,6 +1013,11 @@ function settleProjectLoadWhenQuiet(client: LspClient): void {
 		// After a folder add, only progress that began since ends the load.
 		if (client.activeProgressTokens.size === 0 && !workspaceFolderStates.get(client)?.pendingLoads) {
 			client.resolveProjectLoaded();
+			const native = client.nativeBasedpyright;
+			if (native?.analysisCompleted) {
+				native.ready = true;
+				releaseReadyNativePermit(client);
+			}
 		}
 	}, PROJECT_LOAD_QUIET_MS);
 	timer.unref?.();
@@ -925,6 +1079,17 @@ export async function ensureWorkspaceFolders(
 	filePaths: readonly string[],
 	signal?: AbortSignal,
 ): Promise<void> {
+	if (client.nativeBasedpyright) {
+		for (const filePath of filePaths) {
+			throwIfAborted(signal);
+			const target = await resolveSyscallTarget(filePath, true);
+			const relative = target === null ? ".." : path.relative(client.cwd, target);
+			if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+				throw new Error("Private Basedpyright cannot open a document outside its workspace");
+			}
+		}
+		return;
+	}
 	const wanted = new Set<string>();
 	for (const filePath of filePaths) {
 		throwIfAborted(signal);
@@ -1572,6 +1737,14 @@ export async function getOrCreateClient(
 	signal?: AbortSignal,
 ): Promise<LspClient> {
 	const key = clientKey(config, cwd);
+	const nativeLock = nativeBasedpyrightLock(config, cwd);
+	const previous = nativeLock ? nativeClients.get(cwd) : undefined;
+	if (previous && (previous.name !== key || previous.nativeBasedpyright?.stopping || previous.status === "error")) {
+		if (previous.nativeBasedpyright?.stopping) await untilAborted(signal, previous.nativeBasedpyright.stopping);
+		if (!releaseNativeGenerationIfGone(previous)) {
+			throw new Error("Private Basedpyright generation has not released its verified process group");
+		}
+	}
 	// Check if client already exists
 	const existingClient = clients.get(key);
 	if (existingClient && !invalidatedClientKeys.has(key)) {
@@ -1635,22 +1808,42 @@ export async function getOrCreateClient(
 			: (config.initOptions ?? {});
 
 		// Wrap with lspmux if available and supported
-		const { command, args, env } = isLspmuxSupported(baseCommand)
-			? await getLspmuxCommand(baseCommand, baseArgs)
-			: { command: baseCommand, args: baseArgs };
+		const { command, args, env } =
+			!nativeLock && isLspmuxSupported(baseCommand)
+				? await getLspmuxCommand(baseCommand, baseArgs)
+				: { command: baseCommand, args: baseArgs };
 
 		// Prefer the daemon-shared server unless an external lspmux wrapper is
 		// already multiplexing this command. Any shared-path failure falls back
 		// to a private spawn so LSP never regresses on daemon trouble.
 		let proc: LspTransport | null = null;
-		if (isSharedLspEnabled() && command === baseCommand) {
+		if (!nativeLock && isSharedLspEnabled() && command === baseCommand) {
 			proc = await connectSharedLspTransport({ command, args, cwd, env, initializationOptions, signal });
 		}
-		proc ??= ptree.spawn([command, ...args], {
-			cwd,
-			stdin: "pipe",
-			env: env ? { ...Bun.env, ...env } : undefined,
-		});
+		let permit: FileLockHandle | undefined;
+		if (nativeLock) {
+			if ((await fs.realpath(cwd)) !== cwd) throw new Error("Private Basedpyright workspace is aliased");
+			try {
+				permit = await acquireFileLock(nativeLock, { signal, timeoutMs: NATIVE_BASEDPYRIGHT_LOCK_WAIT_MS });
+			} catch (error) {
+				throw new Error("Private Basedpyright cold-index lease unavailable within the operation budget", {
+					cause: error,
+				});
+			}
+		}
+		try {
+			throwIfAborted(signal);
+			if (nativeLock && nativeClients.has(cwd)) throw new Error("Private Basedpyright already owns this workspace");
+			proc ??= ptree.spawn([command, ...args], {
+				cwd,
+				stdin: "pipe",
+				detached: nativeLock !== undefined,
+				env: env ? { ...Bun.env, ...env } : undefined,
+			});
+		} catch (error) {
+			permit?.release();
+			throw error;
+		}
 
 		const projectLoad = createProjectLoad();
 		const client: LspClient = {
@@ -1671,14 +1864,28 @@ export async function getOrCreateClient(
 			lastActivity: Date.now(),
 			startedAt: Date.now(),
 			writeQueue: Promise.resolve(),
+			...(permit
+				? {
+						nativeBasedpyright: {
+							permit,
+							writes: 0,
+							analysis: new Set<string | number>(),
+							analysisCompleted: false,
+							ready: false,
+						},
+					}
+				: {}),
 			activeProgressTokens: new Set(),
 			...projectLoad.signal,
 		};
 		projectLoadExtenders.set(client, projectLoad.extend);
+		if (permit) nativeClients.set(cwd, client);
 
 		// Register crash recovery - remove client on process exit
-		proc.exited.then(() => {
-			if (clients.get(key) === client) clients.delete(key);
+		const onExit = () => {
+			if (client.nativeBasedpyright) {
+				if (!releaseNativeGenerationIfGone(client)) client.status = "error";
+			} else if (clients.get(key) === client) clients.delete(key);
 			maybeStopIdleChecker();
 			if (clientLocks.get(key)?.token === lockToken) clientLocks.delete(key);
 			client.resolveProjectLoaded();
@@ -1703,7 +1910,8 @@ export async function getOrCreateClient(
 				}
 				client.pendingRequests.clear();
 			}
-		});
+		};
+		void proc.exited.then(onExit, onExit);
 
 		// Start background message reader. The client is shared by every session
 		// in the process, so its reader's records name none of them.
@@ -1757,8 +1965,11 @@ export async function getOrCreateClient(
 		} catch (err) {
 			// Clean up on initialization failure
 			client.status = "error";
-			if (clients.get(key) === client) clients.delete(key);
-			proc.kill();
+			if (client.nativeBasedpyright) await shutdownClientInstance(client);
+			else {
+				if (clients.get(key) === client) clients.delete(key);
+				proc.kill();
+			}
 			const message = err instanceof Error ? err.message : String(err);
 			// Negative-cache deterministic failures. Timeouts under a
 			// caller-shortened deadline (warmup/writethrough) and caller-signal
@@ -1786,6 +1997,8 @@ export async function getActiveOrPendingClient(
 	throwIfAborted(signal);
 	const client = clients.get(clientKey(config, cwd));
 	if (client) {
+		if (client.nativeBasedpyright && (client.nativeBasedpyright.stopping || client.status === "error"))
+			return undefined;
 		client.lastActivity = Date.now();
 		return client;
 	}
@@ -2280,6 +2493,7 @@ export async function notifyWorkspaceWatchedFiles(
 ): Promise<void> {
 	throwIfAborted(signal);
 	if (changes.length === 0) return;
+	using _nativeOperation = borrowPrivateBasedpyright(cwd);
 
 	const workspace = path.resolve(cwd);
 	const activeClients = Array.from(clients.values()).filter(
@@ -2534,6 +2748,25 @@ async function waitForExit(client: LspClient, timeoutMs: number): Promise<boolea
  * failed teardown, not a completed restart.
  */
 export async function shutdownClientInstance(client: LspClient): Promise<boolean> {
+	const native = client.nativeBasedpyright;
+	if (native) {
+		if (releaseNativeGenerationIfGone(client)) return true;
+		native.stopping ??= Promise.resolve().then(async () => {
+			client.status = "error";
+			try {
+				const ack = await sendRequest(client, "shutdown", null, AbortSignal.timeout(SHUTDOWN_TIMEOUT_MS));
+				if (ack !== null) return false;
+				await sendNotification(client, "exit", undefined, AbortSignal.timeout(EXIT_TIMEOUT_MS));
+				return (await waitForExit(client, EXIT_TIMEOUT_MS)) && releaseNativeGenerationIfGone(client);
+			} catch {
+				return false;
+			}
+		});
+		const closed = await native.stopping;
+		if (!closed)
+			logger.warn("Private Basedpyright exit unverified; generation remains reserved", { cwd: client.cwd });
+		return closed;
+	}
 	if (clients.get(client.name) === client) clients.delete(client.name);
 	maybeStopIdleChecker();
 
